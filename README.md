@@ -5,3 +5,15 @@
 ## 문서
 - [01. 오디오 핑거프린트 기술 리서치](docs/01-research-audio-fingerprinting.md)
 - [02. 심층 기술 검토 (성능 수치·라이선스·수정 계획)](docs/02-deep-review.md)
+- [03. 휴대폰 재녹음 테스트셋 절차서](docs/03-phone-test-protocol.md)
+- [04. 알고리즘 선택 결정 문서 (승인 요청)](docs/04-algorithm-decision.md)
+
+## 기준선 코드 (`afp/`)
+샤잠식 피크 쌍 해시 구현과 평가 도구. 알고리즘 비교용 기준선이며 최종 제품 알고리즘이 아니다.
+
+```bash
+pip install numpy scipy pytest   # ffmpeg 필요
+python -m pytest
+python -m afp.evaluate build --out idx.npz refs/*.wav
+python -m afp.evaluate recording --index idx.npz --recordings rec.wav --order order.csv --songs-dir refs
+```
