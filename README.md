@@ -4,3 +4,4 @@
 
 ## 문서
 - [01. 오디오 핑거프린트 기술 리서치](docs/01-research-audio-fingerprinting.md)
+- [02. 심층 기술 검토 (성능 수치·라이선스·수정 계획)](docs/02-deep-review.md)
