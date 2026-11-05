@@ -1,8 +1,14 @@
 """Evaluation CLI.
 
-  python -m afp.evaluate build     --out idx.npz [--method landmark|triangle] REF_FILES...
+  python -m afp.evaluate build     --out idx.npz [--method landmark|triangle|neural --ckpt CKPT] REF_FILES...
   python -m afp.evaluate synth     --index idx.npz --refs REF_FILES... [--negatives FILES...] [--noise FILES...]
   python -m afp.evaluate recording --index idx.npz --recordings REC.wav... --order order.csv --songs-dir DIR
+  python -m afp.evaluate sdrr      --index idx.npz --root SD-RR-v1.0   (real smartphone re-recordings)
+
+Every query also records `imp`: the best score of any track other than the
+true one. That is what the system would return if the song were not in the
+catalogue, so it gives a false-positive estimate against real, similar music
+(see afp.compare for equal-false-positive comparisons).
 
 Metrics
   top1        : best candidate is the right track (no threshold)
@@ -36,14 +42,23 @@ def _name(path: str) -> str:
 
 
 def load_index(path: str):
-    meta = json.loads(bytes(np.load(path)["meta"]).decode())
-    return TriangleIndex.load(path) if meta.get("kind") == "triangle" else LandmarkIndex.load(path)
+    kind = json.loads(bytes(np.load(path)["meta"]).decode()).get("kind")
+    if kind == "triangle":
+        return TriangleIndex.load(path)
+    if kind == "neural":
+        from .neural import NeuralIndex
+        return NeuralIndex.load(path)
+    return LandmarkIndex.load(path)
 
 
 def build(args) -> None:
     if args.method == "triangle":
         cfg = TriangleConfig()
         idx = TriangleIndex(cfg)
+    elif args.method == "neural":
+        from .neural import NeuralConfig, NeuralIndex
+        cfg = NeuralConfig()
+        idx = NeuralIndex(args.ckpt, cfg)
     else:
         cfg = LandmarkConfig(peaks_per_sec=args.density, fanout=args.fanout)
         idx = LandmarkIndex(cfg)
@@ -73,14 +88,15 @@ def _score(results: list[dict], thresholds=THRESHOLDS) -> dict:
     return out
 
 
-def _run_query(idx: LandmarkIndex, q: np.ndarray, truth: str | None) -> dict:
+def _run_query(idx, q: np.ndarray, truth: str | None) -> dict:
     t0 = time.perf_counter()
     m = idx.query(q, top_k=2)
     ms = 1000 * (time.perf_counter() - t0)
     if not m:
-        return {"correct": False, "score": 0, "pred": None, "ms": ms, "offset": None}
+        return {"correct": False, "score": 0, "imp": 0, "pred": None, "ms": ms, "offset": None}
+    others = [x.score for x in m if x.name != truth]
     return {"correct": truth is not None and m[0].name == truth, "score": m[0].score,
-            "pred": m[0].name, "ms": ms, "offset": m[0].offset_frames}
+            "imp": others[0] if others else 0, "pred": m[0].name, "ms": ms, "offset": m[0].offset_frames}
 
 
 def _load(args):
@@ -169,7 +185,7 @@ def recording(args) -> None:
     dump_f = open(args.dump, "w", newline="") if args.dump else None
     dump = csv.writer(dump_f) if dump_f else None
     if dump:
-        dump.writerow(["recording", "len_s", "truth", "pred", "correct", "aligned", "score", "ms"])
+        dump.writerow(["recording", "len_s", "truth", "pred", "correct", "aligned", "score", "imp", "ms"])
     for rec in args.recordings:
         audio = load_audio(rec, sr)
         spans = song_spans(audio, sr, songs)
@@ -185,13 +201,56 @@ def recording(args) -> None:
                     r["aligned"] = r["correct"] and r["offset"] is not None and abs(r["offset"] * frame_sec - (t - s0)) < 0.5
                     if dump is not None:
                         dump.writerow([_name(rec), L, name, r["pred"], int(r["correct"]), int(r["aligned"]),
-                                       r["score"], round(r["ms"], 2)])
+                                       r["score"], r["imp"], round(r["ms"], 2)])
                     res.append(r)
                     t += L
             row = {"recording": _name(rec), "len_s": L, **_score(res),
                    "aligned_top1": 100 * np.mean([r["aligned"] for r in res])}
             rows.append(row)
             print(_fmt_row(row), flush=True)
+    if dump_f:
+        dump_f.close()
+    _write(args.out, rows)
+
+
+def sdrr(args) -> None:
+    """SD-RR: 1,488 ten-second smartphone re-recordings of 496 references.
+
+    Each query file is cut into L-second windows starting at --starts seconds,
+    so short-query accuracy is measured on real phone recordings.
+    """
+    idx = _load(args)
+    sr = idx.cfg.sr
+    frame_sec = idx.cfg.hop / sr
+    with open(os.path.join(args.root, "manifest.csv")) as f:
+        rows_in = list(csv.DictReader(f))
+    if args.limit:
+        rows_in = rows_in[: args.limit]
+    dump_f = open(args.dump, "w", newline="") if args.dump else None
+    dump = csv.writer(dump_f) if dump_f else None
+    if dump:
+        dump.writerow(["recording", "len_s", "truth", "pred", "correct", "aligned", "score", "imp", "ms"])
+    res: dict[float, list[dict]] = {L: [] for L in args.lengths}
+    for row in rows_in:
+        audio = load_audio(os.path.join(args.root, row["query_path"]), sr)
+        truth = _name(row["reference_path"])
+        begin = float(row["reference_begin_seconds"])
+        for L in args.lengths:
+            for w0 in args.starts:
+                if w0 + L > len(audio) / sr + 1e-6:
+                    continue
+                r = _run_query(idx, audio[int(w0 * sr): int((w0 + L) * sr)], truth)
+                r["aligned"] = r["correct"] and r["offset"] is not None and abs(r["offset"] * frame_sec - (begin + w0)) < 0.5
+                res[L].append(r)
+                if dump:
+                    dump.writerow([_name(row["query_path"]), L, truth, r["pred"], int(r["correct"]), int(r["aligned"]),
+                                   r["score"], r["imp"], round(r["ms"], 2)])
+    rows = []
+    for L in args.lengths:
+        row = {"dataset": "sdrr", "len_s": L, **_score(res[L]),
+               "aligned_top1": 100 * np.mean([r["aligned"] for r in res[L]]) if res[L] else 0.0}
+        rows.append(row)
+        print(_fmt_row(row), flush=True)
     if dump_f:
         dump_f.close()
     _write(args.out, rows)
@@ -219,7 +278,8 @@ def main() -> None:
     b.add_argument("--out", required=True)
     b.add_argument("--density", type=float, default=LandmarkConfig.peaks_per_sec)
     b.add_argument("--fanout", type=int, default=LandmarkConfig.fanout)
-    b.add_argument("--method", choices=["landmark", "triangle"], default="landmark")
+    b.add_argument("--method", choices=["landmark", "triangle", "neural"], default="landmark")
+    b.add_argument("--ckpt", help="neural: checkpoint path (e.g. .../nmfp-triplet/ckpt-100)")
     b.add_argument("refs", nargs="+")
     b.set_defaults(fn=build)
 
@@ -249,6 +309,17 @@ def main() -> None:
                    help="remove the recorded songs from the index and measure false positives")
     r.add_argument("--out")
     r.set_defaults(fn=recording)
+
+    d = sub.add_parser("sdrr")
+    d.add_argument("--index", required=True)
+    d.add_argument("--root", required=True, help="extracted SD-RR-v1.0 directory")
+    d.add_argument("--lengths", nargs="+", type=float, default=[1, 2, 3, 5, 10])
+    d.add_argument("--starts", nargs="+", type=float, default=[0.0, 5.0])
+    d.add_argument("--limit", type=int, default=0)
+    d.add_argument("--mode", choices=["o", "a", "f"], help="triangle index query mode")
+    d.add_argument("--dump")
+    d.add_argument("--out")
+    d.set_defaults(fn=sdrr)
 
     args = ap.parse_args()
     args.fn(args)
