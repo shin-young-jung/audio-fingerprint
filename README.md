@@ -8,7 +8,7 @@
 - [03. 휴대폰 재녹음 테스트셋 절차서](docs/03-phone-test-protocol.md)
 - [04. 알고리즘 선택 결정 문서 (승인 요청)](docs/04-algorithm-decision.md)
 - [05. 상용 음원 검색 서비스 기술 조사 (샤잠·사운드하운드·구글·네이버 등)](docs/05-industry-research.md)
-- [06. 알고리즘 맞대결 중간 결과 (진행 중)](docs/06-head-to-head-interim.md)
+- [06. 알고리즘 맞대결 중간 결과 (3방식 직접 비교 포함)](docs/06-head-to-head-interim.md)
 
 ## 기준선 코드 (`afp/`)
 샤잠식 피크 쌍 해시 구현과 평가 도구. 알고리즘 비교용 기준선이며 최종 제품 알고리즘이 아니다.
