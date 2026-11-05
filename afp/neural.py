@@ -38,6 +38,14 @@ class NeuralConfig:
     amin: float = 1e-5
     emb: int = 128
     top_k: int = 20          # neighbours per query segment
+    # Feature variants of the two public checkpoint families:
+    #   "nmfp": essentia mel, essentia framing (33 frames/s), scaled to [-1, 1]
+    #   "nafp": kapre/librosa mel, kapre framing (32 frames/s), scaled to [0, 1]
+    frontend: str = "nmfp"
+
+    @property
+    def scale_div(self) -> float:
+        return self.dyn_range / 2 if self.frontend == "nmfp" else self.dyn_range
 
     @property
     def hop(self) -> int:     # used by the evaluator to convert offsets to seconds
@@ -52,9 +60,24 @@ class NeuralConfig:
 _MEL_CACHE: dict = {}
 
 
+PRESETS = {
+    "nmfp": dict(f_min=160.0, frontend="nmfp"),   # Araz et al. 2025 checkpoints
+    "nafp": dict(f_min=300.0, frontend="nafp"),   # Chang et al. 2021 recipe (Deezer re-trained checkpoint)
+}
+
+
 def mel_matrix(cfg: NeuralConfig) -> np.ndarray:
-    """Essentia MelBands (slaney, unit_tri) as a matrix; it is linear in its input."""
-    key = (cfg.sr, cfg.n_fft, cfg.n_mels, cfg.f_min, cfg.f_max)
+    """Mel filterbank as a (bins, mels) matrix."""
+    key = (cfg.sr, cfg.n_fft, cfg.n_mels, cfg.f_min, cfg.f_max, cfg.frontend)
+    if key in _MEL_CACHE:
+        return _MEL_CACHE[key]
+    if cfg.frontend == "nafp":
+        # kapre's ApplyFilterbank('mel') uses the librosa slaney filterbank.
+        import librosa
+        _MEL_CACHE[key] = librosa.filters.mel(sr=cfg.sr, n_fft=cfg.n_fft, n_mels=cfg.n_mels, fmin=cfg.f_min,
+                                              fmax=cfg.f_max, htk=False, norm="slaney").T.astype(np.float32)
+        return _MEL_CACHE[key]
+    # Essentia MelBands (slaney, unit_tri) is linear in its input.
     if key not in _MEL_CACHE:
         import essentia.standard as es
         mb = es.MelBands(highFrequencyBound=cfg.f_max, inputSize=cfg.n_fft // 2 + 1, log=False,
@@ -78,9 +101,14 @@ def melspec(segs: np.ndarray, cfg: NeuralConfig) -> np.ndarray:
     """(B, L) segments -> (B, n_mels, T, 1) scaled log-mel, each segment centred and zero padded."""
     # Essentia FrameGenerator(startFromZero=False, lastFrameToEndOfFile=True): frames centred on
     # 0, hop, 2*hop, ... until a centre passes the end; zero padding outside the segment.
+    # kapre (NAFP): 'same' padding of n_fft/2 on both sides, frames start at 0, hop, ... inside it.
     pad = cfg.n_fft // 2
-    xp = np.pad(segs, ((0, 0), (pad, cfg.n_fft)))
-    n_frames = 1 + int(np.ceil(segs.shape[1] / cfg.stft_hop))
+    if cfg.frontend == "nafp":
+        xp = np.pad(segs, ((0, 0), (pad, pad)))
+        n_frames = 1 + (xp.shape[1] - cfg.n_fft) // cfg.stft_hop
+    else:
+        xp = np.pad(segs, ((0, 0), (pad, cfg.n_fft)))
+        n_frames = 1 + int(np.ceil(segs.shape[1] / cfg.stft_hop))
     starts = cfg.stft_hop * np.arange(n_frames)
     frames = xp[:, starts[:, None] + np.arange(cfg.n_fft)[None, :]]           # (B, T, n_fft)
     win = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(cfg.n_fft) / cfg.n_fft)).astype(np.float32)
@@ -89,7 +117,7 @@ def melspec(segs: np.ndarray, cfg: NeuralConfig) -> np.ndarray:
     mel = np.maximum(mel, cfg.amin)
     db = 20 * np.log10(mel / mel.max(axis=(1, 2), keepdims=True))
     db = np.maximum(db, -cfg.dyn_range)
-    scaled = 1 + db / (cfg.dyn_range / 2)
+    scaled = 1 + db / cfg.scale_div
     return np.transpose(scaled, (0, 2, 1))[..., None].astype(np.float32)
 
 
@@ -154,7 +182,7 @@ class Embedder:
         tf = _tf()
         self.cfg = cfg
         self.model = build_model(cfg)
-        T = 1 + int(np.ceil(cfg.seg_s * cfg.sr / cfg.stft_hop))
+        T = melspec(np.zeros((1, int(cfg.seg_s * cfg.sr)), np.float32), cfg).shape[2]
         self.model(np.zeros((1, cfg.n_mels, T, 1), np.float32))
         status = tf.train.Checkpoint(model=self.model).restore(ckpt)
         status.expect_partial()
@@ -185,6 +213,7 @@ class NeuralIndex:
         self.starts = np.zeros(1, np.int64)   # first row of each track
         self._faiss = None
         self._mask_tracks: set[int] = set()
+        self.search = "exhaustive"   # or "ann" (per-segment top-k candidates)
 
     def add(self, name: str, x: np.ndarray) -> int:
         e = self.embedder(x)
@@ -225,6 +254,40 @@ class NeuralIndex:
         q = self.embedder(x)
         if len(q) == 0 or len(self.emb) == 0:
             return []
+        if self.search == "exhaustive":
+            return self._query_exhaustive(q, top_k)
+        return self._query_ann(q, top_k)
+
+    def _query_exhaustive(self, q: np.ndarray, top_k: int) -> list[Match]:
+        """Score every track at every alignment (mean similarity along the diagonal).
+
+        This is what the NMFP evaluation in the POLARIS paper calls exhaustive
+        candidate scoring. It is immune to 'hub' segments crowding the true
+        track out of a per-segment top-k list. Cost is O(query segments x DB
+        segments), fine for thousands of tracks; a million-track service needs
+        an ANN index with hubness handling instead.
+        """
+        n_q, N = len(q), len(self.emb)
+        S = q @ self.emb.T
+        D = np.zeros(N, np.float32)
+        for i in range(min(n_q, N)):
+            same = self.tracks[i:] == self.tracks[: N - i]
+            D[: N - i] += np.where(same, S[i, i:], 0.0)
+        D /= n_q
+        if self._mask_tracks:
+            D[np.isin(self.tracks, list(self._mask_tracks))] = -np.inf
+        starts = self.starts[:-1]
+        best = np.maximum.reduceat(D, starts)
+        order = np.argsort(-best)[: max(top_k, 2)]
+        out = []
+        for r, t in enumerate(order[:top_k]):
+            seg = D[self.starts[t]: self.starts[t + 1]]
+            off = int(np.argmax(seg))
+            second = float(best[order[1]]) if r == 0 and len(order) > 1 else float(best[order[0]])
+            out.append(Match(int(t), self.names[int(t)], float(best[t]), off, second))
+        return out
+
+    def _query_ann(self, q: np.ndarray, top_k: int) -> list[Match]:
         k = self.cfg.top_k + 64 * bool(self._mask_tracks)
         _, I = self._index().search(q, k)
         cand = {}

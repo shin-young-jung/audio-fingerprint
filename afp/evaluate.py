@@ -222,7 +222,7 @@ def sdrr(args) -> None:
     idx = _load(args)
     sr = idx.cfg.sr
     frame_sec = idx.cfg.hop / sr
-    with open(os.path.join(args.root, "manifest.csv")) as f:
+    with open(os.path.join(args.root, args.manifest)) as f:
         rows_in = list(csv.DictReader(f))
     if args.limit:
         rows_in = rows_in[: args.limit]
@@ -316,6 +316,7 @@ def main() -> None:
     d.add_argument("--lengths", nargs="+", type=float, default=[1, 2, 3, 5, 10])
     d.add_argument("--starts", nargs="+", type=float, default=[0.0, 5.0])
     d.add_argument("--limit", type=int, default=0)
+    d.add_argument("--manifest", default="manifest.csv")
     d.add_argument("--mode", choices=["o", "a", "f"], help="triangle index query mode")
     d.add_argument("--dump")
     d.add_argument("--out")
