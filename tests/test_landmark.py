@@ -81,3 +81,15 @@ def test_remove_tracks_turns_query_into_negative():
     idx.remove_tracks({"t1"})
     m = idx.query(tracks[1][SR * 2: SR * 5])
     assert not m or m[0].name != "t1"
+
+
+def test_triangle_index_finds_excerpt_and_offset():
+    from afp.triangle import TriangleIndex
+    idx = TriangleIndex()
+    tracks = [synth_track(s) for s in range(4)]
+    for i, x in enumerate(tracks):
+        idx.add(f"t{i}", x)
+    idx.finalize()
+    m = idx.query(tracks[2][SR * 5: SR * 8])
+    assert m[0].name == "t2"
+    assert abs(m[0].offset_frames * idx.cfg.hop / SR - 5.0) < 0.1

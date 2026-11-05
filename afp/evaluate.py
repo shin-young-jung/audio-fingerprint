@@ -1,6 +1,6 @@
 """Evaluation CLI.
 
-  python -m afp.evaluate build     --out idx.npz  REF_FILES...
+  python -m afp.evaluate build     --out idx.npz [--method landmark|triangle] REF_FILES...
   python -m afp.evaluate synth     --index idx.npz --refs REF_FILES... [--negatives FILES...] [--noise FILES...]
   python -m afp.evaluate recording --index idx.npz --recordings REC.wav... --order order.csv --songs-dir DIR
 
@@ -26,6 +26,7 @@ from .audio import load_audio
 from .degrade import PRESETS, apply
 from .index import LandmarkIndex
 from .landmark import LandmarkConfig
+from .triangle import TriangleConfig, TriangleIndex
 
 THRESHOLDS = (5, 8, 12, 20)
 
@@ -34,9 +35,18 @@ def _name(path: str) -> str:
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def load_index(path: str):
+    meta = json.loads(bytes(np.load(path)["meta"]).decode())
+    return TriangleIndex.load(path) if meta.get("kind") == "triangle" else LandmarkIndex.load(path)
+
+
 def build(args) -> None:
-    cfg = LandmarkConfig(peaks_per_sec=args.density, fanout=args.fanout)
-    idx = LandmarkIndex(cfg)
+    if args.method == "triangle":
+        cfg = TriangleConfig()
+        idx = TriangleIndex(cfg)
+    else:
+        cfg = LandmarkConfig(peaks_per_sec=args.density, fanout=args.fanout)
+        idx = LandmarkIndex(cfg)
     total_sec = 0.0
     t0 = time.perf_counter()
     for p in args.refs:
@@ -73,8 +83,10 @@ def _run_query(idx: LandmarkIndex, q: np.ndarray, truth: str | None) -> dict:
             "pred": m[0].name, "ms": ms, "offset": m[0].offset_frames}
 
 
-def _load(args) -> LandmarkIndex:
-    idx = LandmarkIndex.load(args.index)
+def _load(args):
+    idx = load_index(args.index)
+    if getattr(args, "mode", None) and isinstance(idx, TriangleIndex):
+        idx.mode = args.mode
     if getattr(args, "distractors", 0):
         t0 = time.perf_counter()
         idx.add_synthetic_distractors(args.distractors)
@@ -154,6 +166,10 @@ def recording(args) -> None:
         idx.remove_tracks({n for n, _ in songs})
     frame_sec = idx.cfg.hop / sr
     rows = []
+    dump_f = open(args.dump, "w", newline="") if args.dump else None
+    dump = csv.writer(dump_f) if dump_f else None
+    if dump:
+        dump.writerow(["recording", "len_s", "truth", "pred", "correct", "aligned", "score", "ms"])
     for rec in args.recordings:
         audio = load_audio(rec, sr)
         spans = song_spans(audio, sr, songs)
@@ -167,12 +183,17 @@ def recording(args) -> None:
                     r = _run_query(idx, q, name)
                     # A hit must also land at the right position inside the song.
                     r["aligned"] = r["correct"] and r["offset"] is not None and abs(r["offset"] * frame_sec - (t - s0)) < 0.5
+                    if dump is not None:
+                        dump.writerow([_name(rec), L, name, r["pred"], int(r["correct"]), int(r["aligned"]),
+                                       r["score"], round(r["ms"], 2)])
                     res.append(r)
                     t += L
             row = {"recording": _name(rec), "len_s": L, **_score(res),
                    "aligned_top1": 100 * np.mean([r["aligned"] for r in res])}
             rows.append(row)
             print(_fmt_row(row), flush=True)
+    if dump_f:
+        dump_f.close()
     _write(args.out, rows)
 
 
@@ -198,6 +219,7 @@ def main() -> None:
     b.add_argument("--out", required=True)
     b.add_argument("--density", type=float, default=LandmarkConfig.peaks_per_sec)
     b.add_argument("--fanout", type=int, default=LandmarkConfig.fanout)
+    b.add_argument("--method", choices=["landmark", "triangle"], default="landmark")
     b.add_argument("refs", nargs="+")
     b.set_defaults(fn=build)
 
@@ -221,6 +243,8 @@ def main() -> None:
     r.add_argument("--songs-dir", required=True)
     r.add_argument("--lengths", nargs="+", type=float, default=[1, 2, 3, 5])
     r.add_argument("--distractors", type=int, default=0)
+    r.add_argument("--mode", choices=["o", "a", "f"], help="triangle index query mode")
+    r.add_argument("--dump", help="write one row per query (for equal-false-positive comparisons)")
     r.add_argument("--as-negatives", action="store_true",
                    help="remove the recorded songs from the index and measure false positives")
     r.add_argument("--out")
